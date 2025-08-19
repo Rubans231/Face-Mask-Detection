@@ -2,7 +2,7 @@
 import os
 import cv2
 import numpy as np
-from tkinter import Tk, Label, Frame, filedialog
+from tkinter import Label, Frame
 from tkinterdnd2 import TkinterDnD, DND_FILES  # drag-and-drop support
 from PIL import Image, ImageTk
 from tensorflow.keras.models import load_model
@@ -19,18 +19,20 @@ print("Loading model...")
 if not os.path.exists(MODEL_PATH):
     raise FileNotFoundError(f"Model not found at {MODEL_PATH}. Run train.py first.")
 
-# Load model
 model = load_model(MODEL_PATH)
 
-# Re-compile the model to build metrics
-model.compile(
-    optimizer='adam',
-    loss='categorical_crossentropy',
-    metrics=['accuracy']
-)
+# Compile to ensure metrics available (optional for inference, but keeps metrics defined)
+try:
+    model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+except Exception:
+    # Some saved models may not recompile cleanly; ignore since we're only predicting
+    pass
 
 # Load OpenCV's Haar Cascade for face detection
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+face_cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+if not os.path.exists(face_cascade_path):
+    raise FileNotFoundError(f"Haar cascade not found at: {face_cascade_path}")
+face_cascade = cv2.CascadeClassifier(face_cascade_path)
 
 # ------------------ GUI Application ------------------
 class MaskDetectionApp:
@@ -66,16 +68,14 @@ class MaskDetectionApp:
         self.label.dnd_bind('<<Drop>>', self.on_drop)
 
     def on_drop(self, event):
-        file_path = event.data
+        # event.data can be a Tcl list: use splitlist to handle spaces/braces/multiple files
+        paths = self.root.tk.splitlist(event.data)
+        if not paths:
+            self.show_message("No file received.")
+            return
 
-        # Clean up path: remove braces if present
-        if file_path.startswith("{") and file_path.endswith("}"):
-            file_path = file_path[1:-1]  # Remove { and }
+        file_path = paths[0].strip()  # Use first file only
 
-        # Trim whitespace
-        file_path = file_path.strip()
-
-        # Validate image file
         if not os.path.isfile(file_path):
             self.show_message("File not found!")
             return
@@ -88,54 +88,87 @@ class MaskDetectionApp:
         self.process_image(file_path)
 
     def process_image(self, image_path):
-        # Read image with OpenCV
-        img = cv2.imread(image_path)
-        if img is None:
+        # Read image with OpenCV (BGR)
+        img_bgr = cv2.imread(image_path)
+        if img_bgr is None:
             self.show_message("Could not read image.")
             return
 
-        # Convert BGR to RGB for display
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        h, w, _ = img_rgb.shape
+        # Convert BGR to RGB for display/drawing
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-        # Detect faces
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+        # Detect faces (on grayscale)
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=5)
 
-        # Predict mask for each face
+        if len(faces) == 0:
+            # Show the image as-is and message
+            self._display_image(img_rgb)
+            self.label.config(text="No faces detected.")
+            return
+
+        # Prepare batch for model
+        face_inputs = []
+        face_boxes = []
         for (x, y, w_face, h_face) in faces:
-            face_crop = img_rgb[y:y+h_face, x:x+w_face]
-            face_resized = cv2.resize(face_crop, (IMG_SIZE, IMG_SIZE))
-            face_normalized = face_resized / 255.0
-            face_input = np.expand_dims(face_normalized, axis=0)
+            # Clip to bounds (robustness)
+            x0, y0 = max(0, x), max(0, y)
+            x1, y1 = min(img_rgb.shape[1], x + w_face), min(img_rgb.shape[0], y + h_face)
+            face_crop = img_rgb[y0:y1, x0:x1]
+            if face_crop.size == 0:
+                continue
 
-            pred = model.predict(face_input)[0]
-            class_id = np.argmax(pred)
+            face_resized = cv2.resize(face_crop, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
+            face_normalized = face_resized.astype(np.float32) / 255.0
+            face_inputs.append(face_normalized)
+            face_boxes.append((x, y, w_face, h_face))
+
+        if not face_inputs:
+            self._display_image(img_rgb)
+            self.label.config(text="No valid face crops found.")
+            return
+
+        batch = np.stack(face_inputs, axis=0)  # shape: (N, IMG_SIZE, IMG_SIZE, 3)
+
+        # Predict in one go (fast)
+        preds = model.predict(batch, verbose=0)  # shape: (N, num_classes)
+
+        # Draw results
+        mask_count = 0
+        for (x, y, w_face, h_face), pred in zip(face_boxes, preds):
+            class_id = int(np.argmax(pred))
             label = LABELS[class_id]
-            color = COLORS[class_id]
-            confidence = f"{pred[class_id]*100:.1f}%"
+            color_bgr = COLORS[class_id]
+            confidence = f"{pred[class_id] * 100:.1f}%"
 
-            # Draw bounding box and label on image
-            cv2.rectangle(img_rgb, (x, y), (x + w_face, y + h_face), color[::-1], 2)  # OpenCV uses BGR
+            # We are drawing on an RGB image; cv2 expects BGR colors.
+            # Convert BGR -> RGB for correct color on RGB image by reversing.
+            color_rgb = color_bgr[::-1]
+
+            cv2.rectangle(img_rgb, (x, y), (x + w_face, y + h_face), color_rgb, 2)
             cv2.putText(img_rgb, f"{label} ({confidence})", (x, y - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color[::-1], 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_rgb, 2)
 
+            if class_id == 1:
+                mask_count += 1
+
+        # Show image
+        self._display_image(img_rgb)
+
+        # Update status (reuse computed results)
+        num_faces = len(face_boxes)
+        status = f"Detected {num_faces} face(s): {mask_count} with mask, {num_faces - mask_count} without"
+        self.label.config(text=status)
+
+    def _display_image(self, img_rgb):
         # Resize image for display if too large
         max_size = (700, 400)
         pil_img = Image.fromarray(img_rgb)
         pil_img.thumbnail(max_size, Image.Resampling.LANCZOS)
 
-        # Display image
         tk_img = ImageTk.PhotoImage(pil_img)
         self.image_label.config(image=tk_img)
         self.image_label.image = tk_img  # Keep reference
-
-        # Update status
-        num_faces = len(faces)
-        status = f"Detected {num_faces} face(s): "
-        mask_count = sum(1 for f in faces if np.argmax(model.predict(np.expand_dims(np.resize(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)[f[1]:f[1]+f[3], f[0]:f[0]+f[2]], (IMG_SIZE, IMG_SIZE)) / 255.0, (1, IMG_SIZE, IMG_SIZE, 3)))) == 1)
-        status += f"{mask_count} with mask, {num_faces - mask_count} without"
-        self.label.config(text=status)
 
     def show_message(self, msg):
         self.label.config(text=msg)
@@ -146,7 +179,7 @@ if __name__ == "__main__":
     # Check if model exists
     if not os.path.exists(MODEL_PATH):
         print(f"Model not found at {MODEL_PATH}. Please run train.py first.")
-        exit(1)
+        raise SystemExit(1)
 
     # Use TkinterDnD (enhanced Tkinter with drag-and-drop)
     root = TkinterDnD.Tk()
