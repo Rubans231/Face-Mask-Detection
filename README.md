@@ -10,4 +10,4 @@
 - # Working
 
 - Clone the URL and open up a script. It should just work. I hope
-- If it doesn't work, post it in issues and I'll check it out later
+- If it doesn't work, post in issues and I'll check it out later
